@@ -27,3 +27,4 @@ This repository contains a Python script (`create_dsm_chm.py`) designed to gener
    git clone https://github.com/your-username/dsm-chm-generator.git
    cd dsm-chm-generator
 
+![image](https://github.com/user-attachments/assets/76ac3a4b-9a7b-4f6c-a0d8-46c93953fc01)
