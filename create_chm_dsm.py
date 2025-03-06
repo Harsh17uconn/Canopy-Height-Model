@@ -1,25 +1,33 @@
 """"Original code by Harshana Wedegedara"""
 import os
 import json
-import pdal
-import rasterio
+import multiprocessing
 import numpy as np
+import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+import pdal
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename="chm_processing.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Helper functions
+def read_raster(file_path):
+    with rasterio.open(file_path) as src:
+        array = src.read(1)
+        transform = src.transform
+        crs = src.crs
+    return array, transform, crs
 
 def resample_dem_to_1m(dem_path):
-    """
-    Resample a DEM to 1 meter resolution (in-memory operation).
-
-    Args:
-        dem_path (str): Path to the input DEM file.
-
-    Returns:
-        tuple: Resampled DEM array, transform, and CRS.
-    """
     with rasterio.open(dem_path) as dem:
         transform, width, height = calculate_default_transform(
-            dem.crs, dem.crs, dem.width, dem.height, *dem.bounds, resolution=3.28084
-        )  # Set resolution to 1 meter
+            dem.crs, dem.crs, dem.width, dem.height, *dem.bounds, resolution=1
+        )
         resampled_dem = np.empty((height, width), dtype=np.float32)
         reproject(
             source=rasterio.band(dem, 1),
@@ -28,66 +36,42 @@ def resample_dem_to_1m(dem_path):
             src_crs=dem.crs,
             dst_transform=transform,
             dst_crs=dem.crs,
-            resampling=Resampling.bilinear  # Bilinear resampling for elevation data
+            resampling=Resampling.bilinear
         )
-
     return resampled_dem, transform, dem.crs
 
-def create_dsm_chm(las_file, dem_path, output_folder):
+def create_dsm_chm(las_file, dem_path, output_folder_dsm, output_folder_chm, worker_id):
     """
-    Create DSM and CHM from a LAS file and DEM (in-memory DSM via /vsimem/).
-
-    Args:
-        las_file (str): Path to the input LAS file.
-        dem_path (str): Path to the input DEM file.
-        output_folder (str): Path to the output folder for saving results.
-
-    Returns:
-        tuple: CHM data, transform, and CRS.
+    Generate DSM and CHM from a LAS file and corresponding DEM.
+    Includes only first returns and classifications 3, 4, and 5.
     """
     file_basename = os.path.splitext(os.path.basename(las_file))[0]
-
-    # Resample DEM to 1 meter resolution (in-memory)
     dem_array, dem_transform, dem_crs = resample_dem_to_1m(dem_path)
 
-    # Save resampled DEM with "_DEM.tif" suffix
-    dem_resampled_path = os.path.join(output_folder, f"{file_basename}_DEM.tif")
-    with rasterio.open(
-        dem_resampled_path, 'w', driver='GTiff', height=dem_array.shape[0], width=dem_array.shape[1],
-        count=1, dtype=np.float32, crs=dem_crs, transform=dem_transform
-    ) as dst:
-        dst.write(dem_array, 1)
-
-    print(f"Resampled DEM saved to: {dem_resampled_path}")
-
-    # Define PDAL pipeline for DSM with the same resolution as DEM (1 meter)
-    dsm_vsimem_path = f"/vsimem/{file_basename}_DSM.tif"
+    # Define DSM output path
+    dsm_output_path = os.path.join(output_folder_dsm, f"{file_basename}_worker_{worker_id}.tif")
     dsm_pipeline = [
         {"type": "readers.las", "filename": las_file},
+        {"type": "filters.range", "limits": "Classification[3:5],ReturnNumber[1:1]"},
         {"type": "filters.reprojection", "out_srs": str(dem_crs)},
-        {"type": "filters.range", "limits": "Classification[4:5]"},
-        {
-            "type": "writers.gdal",
-            "filename": dsm_vsimem_path,
-            "output_type": "max",
-            "radius": 3.28084,
-            "resolution": 3.28084,
-            "nodata": -9999,
-            "gdaldriver": "GTiff"
-        }
+        {"type": "writers.gdal", 
+         "filename": dsm_output_path,  
+         "output_type": "max", 
+         "radius": 1,  
+         "resolution": 1, 
+         "nodata": -9999, 
+         "gdaldriver": "GTiff"}
     ]
 
-    # Run DSM pipeline
+    # Execute DSM pipeline and save directly to file (no in-memory storage)
     dsm_pipeline_obj = pdal.Pipeline(json.dumps(dsm_pipeline))
     dsm_pipeline_obj.execute()
 
-    # Read the DSM from virtual memory
-    with rasterio.open(dsm_vsimem_path) as dsm:
+    # Read DSM from file for CHM calculation
+    with rasterio.open(dsm_output_path) as dsm:
         dsm_data = dsm.read(1)
 
-        # Check if DSM shape matches DEM shape
         if dsm_data.shape != dem_array.shape:
-            print(f"Resampling DSM to match DEM dimensions for {file_basename}...")
             dsm_resampled = np.empty(dem_array.shape, dtype=np.float32)
             reproject(
                 source=dsm_data,
@@ -100,60 +84,88 @@ def create_dsm_chm(las_file, dem_path, output_folder):
             )
             dsm_data = dsm_resampled
 
-    # Calculate CHM by subtracting DEM from DSM (in-memory operation)
+    # Calculate CHM
     chm_data = dsm_data - dem_array
     chm_data[(dsm_data == -9999) | (dem_array == -9999)] = -9999
-    chm_data[chm_data < 6.5] = 0  # Threshold for minimum height
-    chm_data[chm_data > 115] = 0  # Threshold for maximum height
+    chm_data[chm_data < 0] = 0
+    chm_data[chm_data > 60] = 0
 
-    return chm_data, dem_transform, dem_crs
+    # Save CHM to disk as a .tif file
+    chm_path = os.path.join(output_folder_chm, f"{file_basename}_worker_{worker_id}.tif")
+    with rasterio.open(
+        chm_path, 'w', driver='GTiff', height=chm_data.shape[0], width=chm_data.shape[1],
+        count=1, dtype=np.float32, crs=dem_crs, transform=dem_transform
+    ) as dst:
+        dst.write(chm_data, 1)
 
-def process_las_and_dem_files(las_folder, dem_folder, output_folder):
+    logging.info(f"CHM saved to: {chm_path}")
+    return chm_path
+
+def process_las_file(las_file, las_folder, dem_folder, output_folder_dsm, output_folder_chm, worker_id):
     """
-    Process LAS and DEM files to create CHMs (in-memory operation).
-
-    Args:
-        las_folder (str): Path to the folder containing LAS files.
-        dem_folder (str): Path to the folder containing DEM files.
-        output_folder (str): Path to the folder for saving CHM and DEM files.
+    Process a single LAS file by creating the DSM and CHM.
+    Skips if CHM already exists.
     """
-    las_files = [f for f in os.listdir(las_folder) if f.endswith(".las")]
-    dem_files = [f for f in os.listdir(dem_folder) if f.endswith(".tif")]
+    las_file_name = os.path.basename(las_file)
+    grid_name = os.path.splitext(las_file_name)[0]
 
-    for las_file in las_files:
-        las_basename = os.path.splitext(las_file)[0]
-        matching_dems = [dem_file for dem_file in dem_files if las_basename in dem_file]
+    las_file_path = os.path.join(las_folder, las_file_name)
+    dem_file_path = os.path.join(dem_folder, f"{grid_name}.tif")
+    chm_output_path = os.path.join(output_folder_chm, f"{grid_name}_worker_{worker_id}.tif")
 
-        if matching_dems:
-            dem_file = matching_dems[0]
-            las_path = os.path.join(las_folder, las_file)
-            dem_path = os.path.join(dem_folder, dem_file)
+    if not os.path.exists(dem_file_path):
+        logging.warning(f"DEM file not found for {grid_name}. Skipping.")
+        return None
 
-            print(f"Processing LAS: {las_file} with DEM: {dem_file}")
+    if os.path.exists(chm_output_path):
+        logging.info(f"Worker {worker_id} CHM already exists for {grid_name}. Skipping.")
+        return None
 
-            # Create CHM
-            chm_data, dem_transform, dem_crs = create_dsm_chm(las_path, dem_path, output_folder)
+    logging.info(f"Worker {worker_id} processing {grid_name}.")
+    try:
+        create_dsm_chm(las_file_path, dem_file_path, output_folder_dsm, output_folder_chm, worker_id)
+        logging.info(f"Worker {worker_id} completed {grid_name}.")
+        return f"Worker {worker_id} completed {grid_name}"
+    except Exception as e:
+        logging.error(f"Worker {worker_id} failed to process {grid_name}: {e}")
+        return None
 
-            # Save CHM
-            chm_path = os.path.join(output_folder, f"{las_basename}_CHM.tif")
-            with rasterio.open(
-                chm_path, 'w', driver='GTiff', height=chm_data.shape[0], width=chm_data.shape[1],
-                count=1, dtype=np.float32, crs=dem_crs, transform=dem_transform
-            ) as dst:
-                dst.write(chm_data, 1)
+def worker(worker_id, tasks, las_folder, dem_folder, output_folder_dsm, output_folder_chm):
+    """
+    Worker function for processing LAS files.
+    """
+    for las_file in tasks:
+        process_las_file(las_file, las_folder, dem_folder, output_folder_dsm, output_folder_chm, worker_id)
 
-            print(f"CHM saved to: {chm_path}")
-        else:
-            print(f"No matching DEM found for LAS: {las_file}")
+def parallel_process_tiles(las_files, num_workers, las_folder, dem_folder, output_folder_dsm, output_folder_chm):
+    """
+    Parallel processing of LAS files using multiple workers.
+    """
+    chunk_size = max(1, len(las_files) // num_workers)
+    file_chunks = [las_files[i:i + chunk_size] for i in range(0, len(las_files), chunk_size)]
 
-# Example usage
-if __name__ == "__main__":
-    las_folder = "path/to/your/las/folder"  # Folder with .las files
-    dem_folder = "path/to/your/dem/folder"  # Folder with DEM files
-    output_folder = "path/to/your/output/folder"  # Folder to save CHM and DEM files
+    with multiprocessing.Pool(num_workers) as pool:
+        pool.starmap(worker, [
+            (worker_id, file_chunks[worker_id], las_folder, dem_folder, output_folder_dsm, output_folder_chm)
+            for worker_id in range(num_workers)
+        ])
 
-    # Ensure output folder exists
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+if __name__ == '__main__':
+    LAS_FOLDER = "path/to/your/las/folder"
+    DEM_FOLDER = "path/to/your/dem/folder"
+    OUTPUT_FOLDER_DSM = "path/to/your/output/dsm/folder"
+    OUTPUT_FOLDER_CHM = "path/to/your/output/chm/folder"
 
-    process_las_and_dem_files(las_folder, dem_folder, output_folder)
+    # Create output directories if they don't exist
+    os.makedirs(OUTPUT_FOLDER_DSM, exist_ok=True)
+    os.makedirs(OUTPUT_FOLDER_CHM, exist_ok=True)
+
+    # List all .laz files in the LAS folder
+    las_files = [os.path.join(LAS_FOLDER, f) for f in os.listdir(LAS_FOLDER) if f.endswith(".laz")]
+
+    # Number of workers
+    num_workers = min(50, len(las_files))
+
+    logging.info(f"Using {num_workers} workers for {len(las_files)} LAS files.")
+
+    parallel_process_tiles(las_files, num_workers, LAS_FOLDER, DEM_FOLDER, OUTPUT_FOLDER_DSM, OUTPUT_FOLDER_CHM)
