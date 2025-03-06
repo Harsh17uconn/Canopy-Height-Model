@@ -27,5 +27,7 @@ This repository contains a Python script (`create_dsm_chm.py`) designed to gener
    git clone https://github.com/your-username/dsm-chm-generator.git
    cd dsm-chm-generator
 
-- **CHM output**:
+
   ![image](https://github.com/user-attachments/assets/d34965a8-fc13-4566-a587-a47665305fae)
+
+- **Figure**: Canopy Height Model
