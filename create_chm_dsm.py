@@ -164,7 +164,7 @@ if __name__ == '__main__':
     las_files = [os.path.join(LAS_FOLDER, f) for f in os.listdir(LAS_FOLDER) if f.endswith(".laz")]
 
     # Number of workers
-    num_workers = min(50, len(las_files))
+    num_workers = min(50, len(las_files)) # change the number of CPU's
 
     logging.info(f"Using {num_workers} workers for {len(las_files)} LAS files.")
 
