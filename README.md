@@ -24,6 +24,21 @@ This repository contains a Python script (`create_chm_dsm.py`) designed to gener
    git clone https://github.com/your-username/chm-generation.git
    cd chm-generation
 
+2. Set up a Conda environment (optional but recommended):
+   ```bash
+   conda create -n chm_gen python=3.9 -y
+   conda activate chm_gen
+   pip install pdal rasterio numpy
+
+3. Update the following variables in chm_processing.py with your paths:
+LAS_FOLDER: Path to your LAS files.
+DEM_FOLDER: Path to your DEM files.
+OUTPUT_FOLDER_DSM: Path to save DSM output files.
+OUTPUT_FOLDER_CHM: Path to save CHM output files.
+
+4. Run the script:
+   ```bash
+   python create_chm_dsm.py
 
   ![image](https://github.com/user-attachments/assets/d34965a8-fc13-4566-a587-a47665305fae)
 
